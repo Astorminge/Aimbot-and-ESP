@@ -1,0 +1,1200 @@
+-- LocalScript → StarterPlayer > StarterPlayerScripts
+-- Aim assist + ESP with a settings panel: every option is adjustable in-game and all keys are rebindable.
+-- Open/close the panel with the Menu key (default RightShift) or the AIM button on screen.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+----------------------------------------------------------------------
+-- SETTINGS (defaults - everything below can be changed from the UI)
+----------------------------------------------------------------------
+local function defaults()
+	return {
+		Enabled = false,
+		RequireHold = not UserInputService.TouchEnabled, -- on mobile there is no hold key, so default to always-on
+		WallCheck = true,
+		IgnoreTeammates = true,
+		ShowFovCircle = true,
+		AimPart = "Head", -- Head / Torso / HumanoidRootPart
+		Fov = 30, -- cone half-angle in degrees
+		Speed = 12, -- lock-on snappiness (low = smooth, high = snap)
+		MaxDistance = 500, -- studs
+		FovStep = 5, -- degrees per FovUp/FovDown key press
+		FovFineStep = 0.5, -- degrees per press while holding Left Shift, and for the -/+ buttons
+		ESP = false,
+		ESPTeamColors = true, -- outline players in their team's color
+		ESPShowTeammates = true,
+		ESPHighlight = true, -- full-body glow/outline
+		ESPBox = false, -- 2D box around each player
+		ESPSkeleton = false, -- bone lines
+		ESPFill = true, -- highlight fill (false = outline only)
+		ESPThickness = 1.5, -- box/skeleton line thickness (px)
+		ESPHue = 0, -- color wheel hue (0-1)
+		ESPSat = 0.76, -- color wheel saturation (0-1)
+		ESPVal = 1, -- color brightness (0-1)
+		ESPMaxDistance = 1000, -- studs
+		Keys = {
+			ToggleAim = Enum.KeyCode.Q,
+			ToggleESP = Enum.KeyCode.E,
+			AimHold = Enum.UserInputType.MouseButton2,
+			FovUp = Enum.KeyCode.RightBracket,
+			FovDown = Enum.KeyCode.LeftBracket,
+			Menu = Enum.KeyCode.RightShift,
+		},
+	}
+end
+
+local S = defaults()
+local AIM_PARTS = { "Head", "Torso", "HumanoidRootPart" }
+
+local FOV_MIN, FOV_MAX = 1, 90 -- degrees
+local function clampFov(v: number): number
+	return math.clamp(math.floor(v * 10 + 0.5) / 10, FOV_MIN, FOV_MAX) -- keeps 0.1 precision
+end
+
+local THEME = {
+	Panel = Color3.fromRGB(24, 24, 30),
+	Row = Color3.fromRGB(34, 34, 42),
+	Accent = Color3.fromRGB(90, 140, 255),
+	Text = Color3.fromRGB(235, 235, 240),
+	Dim = Color3.fromRGB(150, 150, 165),
+	Off = Color3.fromRGB(70, 70, 82),
+}
+
+----------------------------------------------------------------------
+-- SMALL UI HELPERS
+----------------------------------------------------------------------
+local function new(class: string, props: { [string]: any }, parent: Instance?)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function round(inst: Instance, radius: number)
+	new("UICorner", { CornerRadius = UDim.new(0, radius) }, inst)
+end
+
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- overlay ignores the top-bar inset so the FOV circle sits exactly on the crosshair
+local overlay = new("ScreenGui", {
+	Name = "AimAssistOverlay",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	DisplayOrder = 99,
+}, playerGui)
+
+local ui = new("ScreenGui", {
+	Name = "AimAssistUI",
+	ResetOnSpawn = false,
+	DisplayOrder = 100,
+}, playerGui)
+
+----------------------------------------------------------------------
+-- FOV CIRCLE + STATUS
+----------------------------------------------------------------------
+local circle = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	BackgroundTransparency = 1,
+	Visible = false,
+}, overlay)
+new("UIStroke", { Thickness = 1.5, Color = Color3.new(1, 1, 1), Transparency = 0.3 }, circle)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, circle)
+
+local status = new("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(12, 8),
+	Size = UDim2.fromOffset(420, 20),
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Font = Enum.Font.GothamMedium,
+	TextSize = 14,
+	TextColor3 = Color3.new(1, 1, 1),
+	TextStrokeTransparency = 0.5,
+}, ui)
+
+local function updateHud()
+	status.Text = ("Aim [%s]: %s   ESP [%s]: %s   FOV: %g°"):format(
+		S.Keys.ToggleAim.Name,
+		S.Enabled and "ON" or "OFF",
+		S.Keys.ToggleESP.Name,
+		S.ESP and "ON" or "OFF",
+		S.Fov
+	)
+
+	local show = S.ShowFovCircle and S.Enabled
+	circle.Visible = show
+	if show then
+		-- convert cone half-angle to a pixel radius on screen
+		local focal = (camera.ViewportSize.Y / 2) / math.tan(math.rad(camera.FieldOfView / 2))
+		local radius = math.tan(math.rad(S.Fov)) * focal
+		circle.Size = UDim2.fromOffset(radius * 2, radius * 2)
+	end
+end
+
+----------------------------------------------------------------------
+-- SETTINGS PANEL
+----------------------------------------------------------------------
+local refreshers = {}
+local function refreshAll()
+	for _, fn in ipairs(refreshers) do
+		fn()
+	end
+end
+
+local listening: string? = nil -- name of the keybind currently being rebound
+
+local panel = new("Frame", {
+	Name = "Panel",
+	Size = UDim2.new(0, 300, 0.85, 0),
+	Position = UDim2.new(0, 20, 0.075, 0),
+	BackgroundColor3 = THEME.Panel,
+	BorderSizePixel = 0,
+	Active = true, -- stops clicks from passing through to the camera
+}, ui)
+round(panel, 10)
+new("UIStroke", { Color = Color3.fromRGB(60, 60, 75), Thickness = 1 }, panel)
+new("UISizeConstraint", { MaxSize = Vector2.new(300, 580) }, panel)
+
+local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1 }, panel)
+new("TextLabel", {
+	Size = UDim2.new(1, -50, 1, 0),
+	Position = UDim2.fromOffset(14, 0),
+	BackgroundTransparency = 1,
+	Text = "Aim Assist",
+	Font = Enum.Font.GothamBold,
+	TextSize = 15,
+	TextColor3 = THEME.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, titleBar)
+
+local closeBtn = new("TextButton", {
+	Size = UDim2.fromOffset(28, 28),
+	Position = UDim2.new(1, -34, 0, 4),
+	BackgroundColor3 = THEME.Row,
+	Text = "X",
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+	TextColor3 = THEME.Text,
+}, titleBar)
+round(closeBtn, 6)
+closeBtn.Activated:Connect(function()
+	panel.Visible = false
+end)
+
+-- drag the panel by its title bar
+do
+	local dragging, dragStart, startPos = false, Vector2.zero, panel.Position
+	titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = Vector2.new(input.Position.X, input.Position.Y)
+			startPos = panel.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if
+			dragging
+			and (
+				input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch
+			)
+		then
+			local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+			panel.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+local list = new("ScrollingFrame", {
+	Position = UDim2.fromOffset(0, 40),
+	Size = UDim2.new(1, 0, 1, -44),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 4,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, panel)
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, list)
+new("UIPadding", {
+	PaddingLeft = UDim.new(0, 12),
+	PaddingRight = UDim.new(0, 12),
+	PaddingBottom = UDim.new(0, 8),
+}, list)
+
+local order = 0
+local function nextOrder()
+	order += 1
+	return order
+end
+
+local function makeHeader(text: string)
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 22),
+		BackgroundTransparency = 1,
+		Text = string.upper(text),
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		TextColor3 = THEME.Dim,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = nextOrder(),
+	}, list)
+end
+
+local function makeRow(height: number)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = THEME.Row,
+		BorderSizePixel = 0,
+		LayoutOrder = nextOrder(),
+	}, list)
+	round(row, 8)
+	return row
+end
+
+local function makeLabel(parent: Instance, text: string, reservedWidth: number)
+	return new("TextLabel", {
+		Size = UDim2.new(1, -reservedWidth, 1, 0),
+		Position = UDim2.fromOffset(12, 0),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = THEME.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, parent)
+end
+
+local function makeToggle(text: string, key: string)
+	local row = makeRow(36)
+	makeLabel(row, text, 70)
+	local pill = new("TextButton", {
+		Size = UDim2.fromOffset(40, 20),
+		Position = UDim2.new(1, -50, 0.5, -10),
+		Text = "",
+		AutoButtonColor = false,
+	}, row)
+	round(pill, 10)
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(16, 16),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+	}, pill)
+	round(knob, 8)
+
+	local function refresh()
+		local on = S[key]
+		pill.BackgroundColor3 = on and THEME.Accent or THEME.Off
+		knob.Position = on and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2)
+	end
+	pill.Activated:Connect(function()
+		S[key] = not S[key]
+		refreshAll()
+	end)
+	table.insert(refreshers, refresh)
+	refresh()
+end
+
+local function makeSlider(text: string, key: string, min: number, max: number, step: number, suffix: string)
+	local row = makeRow(50)
+	new("TextLabel", {
+		Size = UDim2.new(0.6, 0, 0, 24),
+		Position = UDim2.fromOffset(12, 2),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = THEME.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local valueLabel = new("TextLabel", {
+		Size = UDim2.new(0.4, -12, 0, 24),
+		Position = UDim2.new(0.6, 0, 0, 2),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextColor3 = THEME.Accent,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, row)
+	local track = new("Frame", {
+		Size = UDim2.new(1, -24, 0, 6),
+		Position = UDim2.new(0, 12, 0, 34),
+		BackgroundColor3 = THEME.Off,
+		BorderSizePixel = 0,
+	}, row)
+	round(track, 3)
+	local fill = new("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = THEME.Accent,
+		BorderSizePixel = 0,
+	}, track)
+	round(fill, 3)
+	local hit = new("TextButton", {
+		Size = UDim2.new(1, -12, 0, 22),
+		Position = UDim2.new(0, 6, 0, 26),
+		BackgroundTransparency = 1,
+		Text = "",
+	}, row)
+
+	local function refresh()
+		local v = S[key]
+		fill.Size = UDim2.fromScale(math.clamp((v - min) / (max - min), 0, 1), 1)
+		valueLabel.Text = string.format("%g%s", v, suffix)
+	end
+
+	local dragging = false
+	local function setFromX(x: number)
+		local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		local v = min + rel * (max - min)
+		v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+		S[key] = v
+		refreshAll()
+	end
+
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if
+			dragging
+			and (
+				input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch
+			)
+		then
+			setFromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	table.insert(refreshers, refresh)
+	refresh()
+end
+
+local function makeCycle(text: string, key: string, options: { string })
+	local row = makeRow(36)
+	makeLabel(row, text, 150)
+	local btn = new("TextButton", {
+		Size = UDim2.fromOffset(120, 24),
+		Position = UDim2.new(1, -132, 0.5, -12),
+		BackgroundColor3 = THEME.Off,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextColor3 = THEME.Text,
+	}, row)
+	round(btn, 6)
+
+	local function refresh()
+		btn.Text = S[key]
+	end
+	btn.Activated:Connect(function()
+		local idx = table.find(options, S[key]) or 0
+		S[key] = options[idx % #options + 1]
+		refreshAll()
+	end)
+	table.insert(refreshers, refresh)
+	refresh()
+end
+
+local function makeKeybind(text: string, name: string)
+	local row = makeRow(36)
+	makeLabel(row, text, 150)
+	local btn = new("TextButton", {
+		Size = UDim2.fromOffset(120, 24),
+		Position = UDim2.new(1, -132, 0.5, -12),
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextColor3 = THEME.Text,
+	}, row)
+	round(btn, 6)
+
+	local function refresh()
+		local active = listening == name
+		btn.Text = active and "Press a key..." or S.Keys[name].Name
+		btn.BackgroundColor3 = active and THEME.Accent or THEME.Off
+	end
+	btn.Activated:Connect(function()
+		listening = (listening == name) and nil or name
+		refreshAll()
+	end)
+	table.insert(refreshers, refresh)
+	refresh()
+end
+
+-- FOV control: type an exact value, drag the slider (hold Left Shift for fine control), or nudge with -/+
+local function makeFovControl()
+	local row = makeRow(104)
+
+	new("TextLabel", {
+		Size = UDim2.new(0.5, 0, 0, 26),
+		Position = UDim2.fromOffset(12, 2),
+		BackgroundTransparency = 1,
+		Text = "FOV (aim cone)",
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = THEME.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+
+	local box = new("TextBox", {
+		Size = UDim2.fromOffset(64, 22),
+		Position = UDim2.new(1, -90, 0, 4),
+		BackgroundColor3 = THEME.Off,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextColor3 = THEME.Accent,
+		ClearTextOnFocus = false,
+		Text = "",
+	}, row)
+	round(box, 6)
+	new("TextLabel", {
+		Size = UDim2.fromOffset(14, 22),
+		Position = UDim2.new(1, -24, 0, 4),
+		BackgroundTransparency = 1,
+		Text = "°",
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextColor3 = THEME.Dim,
+	}, row)
+
+	local function makeNudge(label: string, position: UDim2)
+		local btn = new("TextButton", {
+			Size = UDim2.fromOffset(26, 24),
+			Position = position,
+			BackgroundColor3 = THEME.Off,
+			Text = label,
+			Font = Enum.Font.GothamBold,
+			TextSize = 16,
+			TextColor3 = THEME.Text,
+		}, row)
+		round(btn, 6)
+		return btn
+	end
+	local minus = makeNudge("-", UDim2.fromOffset(12, 38))
+	local plus = makeNudge("+", UDim2.new(1, -38, 0, 38))
+
+	local track = new("Frame", {
+		Size = UDim2.new(1, -92, 0, 6),
+		Position = UDim2.fromOffset(46, 47),
+		BackgroundColor3 = THEME.Off,
+		BorderSizePixel = 0,
+	}, row)
+	round(track, 3)
+	local fill = new("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = THEME.Accent,
+		BorderSizePixel = 0,
+	}, track)
+	round(fill, 3)
+	local knob = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.fromOffset(14, 14),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+	}, track)
+	round(knob, 7)
+	local hit = new("TextButton", {
+		Size = UDim2.new(1, -84, 0, 26),
+		Position = UDim2.fromOffset(42, 37),
+		BackgroundTransparency = 1,
+		Text = "",
+	}, row)
+
+	new("TextLabel", {
+		Size = UDim2.new(1, -24, 0, 32),
+		Position = UDim2.fromOffset(12, 68),
+		BackgroundTransparency = 1,
+		Text = "Hold Left Shift while dragging (or while using the FOV keys) for fine control. Type a value for an exact FOV.",
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextColor3 = THEME.Dim,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	}, row)
+
+	local function refresh()
+		local rel = (S.Fov - FOV_MIN) / (FOV_MAX - FOV_MIN)
+		fill.Size = UDim2.fromScale(rel, 1)
+		knob.Position = UDim2.fromScale(rel, 0.5)
+		if not box:IsFocused() then
+			box.Text = string.format("%g", S.Fov)
+		end
+	end
+
+	local function setFov(v: number)
+		S.Fov = clampFov(v)
+		refreshAll()
+	end
+
+	-- -/+ buttons use the fine step
+	minus.Activated:Connect(function()
+		setFov(S.Fov - S.FovFineStep)
+	end)
+	plus.Activated:Connect(function()
+		setFov(S.Fov + S.FovFineStep)
+	end)
+
+	-- typed value
+	box.FocusLost:Connect(function()
+		local n = tonumber(string.match(box.Text, "[%d%.]+"))
+		if n then
+			S.Fov = clampFov(n)
+		end
+		refreshAll()
+	end)
+
+	-- slider drag: `ex` is the "effective" pixel position along the track. Normal drag moves it 1:1 with the
+	-- cursor; holding Left Shift moves it at 1/10 speed, so you can switch between coarse and fine mid-drag
+	-- without the value jumping.
+	local FINE_SCALE = 0.1
+	local dragging = false
+	local ex, lastX = 0, 0
+
+	local function valueAt(px: number): number
+		return FOV_MIN + math.clamp(px / track.AbsoluteSize.X, 0, 1) * (FOV_MAX - FOV_MIN)
+	end
+
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			lastX = input.Position.X
+			local width = track.AbsoluteSize.X
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+				-- fine mode from the start: begin at the current value instead of jumping to the cursor
+				ex = (S.Fov - FOV_MIN) / (FOV_MAX - FOV_MIN) * width
+			else
+				ex = math.clamp(lastX - track.AbsolutePosition.X, 0, width)
+				setFov(valueAt(ex))
+			end
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if
+			dragging
+			and (
+				input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch
+			)
+		then
+			local x = input.Position.X
+			local dx = x - lastX
+			lastX = x
+			local fine = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+			ex = math.clamp(ex + dx * (fine and FINE_SCALE or 1), 0, track.AbsoluteSize.X)
+			setFov(valueAt(ex))
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	table.insert(refreshers, refresh)
+	refresh()
+end
+
+-- hue/saturation color wheel (brightness is the slider below it)
+local function makeColorWheel(text: string)
+	local WHEEL = 150
+	local row = makeRow(WHEEL + 44)
+
+	new("TextLabel", {
+		Size = UDim2.new(0.5, 0, 0, 24),
+		Position = UDim2.fromOffset(12, 4),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = THEME.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local hexLabel = new("TextLabel", {
+		Size = UDim2.new(0.4, -40, 0, 24),
+		Position = UDim2.new(0.5, 0, 0, 4),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextColor3 = THEME.Dim,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, row)
+	local swatch = new("Frame", {
+		Size = UDim2.fromOffset(22, 22),
+		Position = UDim2.new(1, -34, 0, 5),
+		BorderSizePixel = 0,
+	}, row)
+	round(swatch, 5)
+
+	local wheel = new("Frame", {
+		Size = UDim2.fromOffset(WHEEL, WHEEL),
+		Position = UDim2.new(0.5, -WHEEL / 2, 0, 34),
+		BackgroundTransparency = 1,
+	}, row)
+
+	-- 180 spokes, each fading from white (center) to the full hue (edge)
+	local SPOKES = 180
+	for i = 0, SPOKES - 1 do
+		local hue = i / SPOKES
+		local spoke = new("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5), -- rotates around the wheel's center
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(WHEEL / 2, 4),
+			Rotation = hue * 360,
+			BorderSizePixel = 0,
+			BackgroundColor3 = Color3.new(1, 1, 1),
+		}, wheel)
+		new("UIGradient", {
+			Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromHSV(hue, 1, 1)),
+		}, spoke)
+	end
+
+	-- darkens the wheel to match the brightness slider
+	local shade = new("Frame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BorderSizePixel = 0,
+	}, wheel)
+	new("UICorner", { CornerRadius = UDim.new(1, 0) }, shade)
+
+	-- marker: white disc with a dark outline, filled with the current color
+	local marker = new("Frame", {
+		Size = UDim2.fromOffset(14, 14),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+	}, wheel)
+	round(marker, 7)
+	new("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 2 }, marker)
+	local markerFill = new("Frame", {
+		Size = UDim2.new(1, -4, 1, -4),
+		Position = UDim2.fromOffset(2, 2),
+		BorderSizePixel = 0,
+	}, marker)
+	round(markerFill, 5)
+
+	local hit = new("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+	}, wheel)
+
+	local function refresh()
+		local color = Color3.fromHSV(S.ESPHue, S.ESPSat, S.ESPVal)
+		swatch.BackgroundColor3 = color
+		markerFill.BackgroundColor3 = color
+		hexLabel.Text = "#" .. string.upper(color:ToHex())
+		shade.BackgroundTransparency = S.ESPVal -- 1 = bright, 0 = black
+
+		local angle = S.ESPHue * 2 * math.pi
+		local dist = S.ESPSat * (WHEEL / 2)
+		marker.Position = UDim2.fromOffset(WHEEL / 2 + math.cos(angle) * dist - 7, WHEEL / 2 + math.sin(angle) * dist - 7)
+	end
+
+	local dragging = false
+	local function pick(input: InputObject)
+		local center = hit.AbsolutePosition + hit.AbsoluteSize / 2
+		local d = Vector2.new(input.Position.X, input.Position.Y) - center
+		S.ESPSat = math.clamp(d.Magnitude / (hit.AbsoluteSize.X / 2), 0, 1)
+		if d.Magnitude > 1 then
+			S.ESPHue = (math.atan2(d.Y, d.X) / (2 * math.pi)) % 1
+		end
+		refreshAll()
+	end
+
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			pick(input)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if
+			dragging
+			and (
+				input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch
+			)
+		then
+			pick(input)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	table.insert(refreshers, refresh)
+	refresh()
+end
+
+-- build the panel
+makeHeader("General")
+makeToggle("Aim assist", "Enabled")
+makeToggle("Hold key to aim", "RequireHold")
+makeToggle("Show FOV circle", "ShowFovCircle")
+
+makeHeader("Targeting")
+makeToggle("Wall check", "WallCheck")
+makeToggle("Ignore teammates", "IgnoreTeammates")
+makeCycle("Aim part", "AimPart", AIM_PARTS)
+
+makeHeader("ESP")
+makeToggle("ESP", "ESP")
+makeToggle("Highlight (glow)", "ESPHighlight")
+makeToggle("Box", "ESPBox")
+makeToggle("Skeleton", "ESPSkeleton")
+makeToggle("Highlight fill", "ESPFill")
+makeToggle("Team colors", "ESPTeamColors")
+makeToggle("Show teammates", "ESPShowTeammates")
+makeSlider("Line thickness", "ESPThickness", 1, 5, 0.5, " px")
+makeSlider("ESP distance", "ESPMaxDistance", 50, 3000, 50, " studs")
+makeColorWheel("ESP color")
+makeSlider("Color brightness", "ESPVal", 0, 1, 0.01, "")
+
+makeHeader("Tuning")
+makeFovControl()
+makeSlider("Lock-on speed", "Speed", 1, 40, 1, "")
+makeSlider("Max distance", "MaxDistance", 50, 2000, 50, " studs")
+makeSlider("FOV key step", "FovStep", 1, 20, 1, "°")
+makeSlider("FOV fine step (Shift, -/+)", "FovFineStep", 0.1, 2, 0.1, "°")
+
+makeHeader("Keybinds (Esc cancels)")
+makeKeybind("Toggle aim", "ToggleAim")
+makeKeybind("Toggle ESP", "ToggleESP")
+makeKeybind("Hold to aim", "AimHold")
+makeKeybind("FOV up", "FovUp")
+makeKeybind("FOV down", "FovDown")
+makeKeybind("Open / close menu", "Menu")
+
+do
+	local row = makeRow(36)
+	local resetBtn = new("TextButton", {
+		Size = UDim2.new(1, -24, 0, 24),
+		Position = UDim2.fromOffset(12, 6),
+		BackgroundColor3 = THEME.Off,
+		Text = "Reset to defaults",
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextColor3 = THEME.Text,
+	}, row)
+	round(resetBtn, 6)
+	resetBtn.Activated:Connect(function()
+		listening = nil
+		for k, v in pairs(defaults()) do
+			S[k] = v
+		end
+		refreshAll()
+	end)
+end
+
+-- small on-screen button (handy on mobile, or if you forget the menu key)
+local menuBtn = new("TextButton", {
+	Size = UDim2.fromOffset(44, 28),
+	Position = UDim2.fromOffset(12, 34),
+	BackgroundColor3 = THEME.Panel,
+	Text = "AIM",
+	Font = Enum.Font.GothamBold,
+	TextSize = 12,
+	TextColor3 = THEME.Text,
+}, ui)
+round(menuBtn, 6)
+menuBtn.Activated:Connect(function()
+	panel.Visible = not panel.Visible
+end)
+
+----------------------------------------------------------------------
+-- TARGETING
+----------------------------------------------------------------------
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getAimPart(char: Model): BasePart?
+	local part
+	if S.AimPart == "Torso" then
+		part = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") -- R15 / R6
+	else
+		part = char:FindFirstChild(S.AimPart)
+	end
+	return (part or char:FindFirstChild("HumanoidRootPart")) :: BasePart?
+end
+
+local function hasLineOfSight(origin: Vector3, part: BasePart, targetChar: Instance): boolean
+	rayParams.FilterDescendantsInstances = { player.Character, targetChar }
+	return Workspace:Raycast(origin, part.Position - origin, rayParams) == nil
+end
+
+-- picks the living player closest to the crosshair inside the FOV cone
+local function getTarget(maxAngle: number): BasePart?
+	local camCF = camera.CFrame
+	local best: BasePart? = nil
+	local bestAngle = math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr == player then
+			continue
+		end
+		if S.IgnoreTeammates and plr.Team ~= nil and plr.Team == player.Team then
+			continue
+		end
+
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local part = char and getAimPart(char)
+
+		if hum and part and hum.Health > 0 then
+			local dir = part.Position - camCF.Position
+			if dir.Magnitude <= S.MaxDistance then
+				local angle = math.deg(math.acos(math.clamp(camCF.LookVector:Dot(dir.Unit), -1, 1)))
+				if angle <= maxAngle and angle < bestAngle then
+					if not S.WallCheck or hasLineOfSight(camCF.Position, part, char) then
+						best, bestAngle = part, angle
+					end
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+----------------------------------------------------------------------
+-- ESP: highlight (glow), 2D box, skeleton
+-- (Highlights show through walls; Roblox allows ~31 active at once,
+-- so lower the ESP distance slider in big servers)
+----------------------------------------------------------------------
+local R15_BONES = {
+	{ "Head", "UpperTorso" },
+	{ "UpperTorso", "LowerTorso" },
+	{ "UpperTorso", "LeftUpperArm" },
+	{ "LeftUpperArm", "LeftLowerArm" },
+	{ "LeftLowerArm", "LeftHand" },
+	{ "UpperTorso", "RightUpperArm" },
+	{ "RightUpperArm", "RightLowerArm" },
+	{ "RightLowerArm", "RightHand" },
+	{ "LowerTorso", "LeftUpperLeg" },
+	{ "LeftUpperLeg", "LeftLowerLeg" },
+	{ "LeftLowerLeg", "LeftFoot" },
+	{ "LowerTorso", "RightUpperLeg" },
+	{ "RightUpperLeg", "RightLowerLeg" },
+	{ "RightLowerLeg", "RightFoot" },
+}
+local MAX_BONES = #R15_BONES -- R6 characters use fewer
+
+local espObjects = {}
+
+local function getObjects(plr: Player)
+	local obj = espObjects[plr]
+	if obj then
+		return obj
+	end
+
+	local folder = new("Folder", { Name = plr.Name }, overlay)
+	local box = new("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false }, folder)
+	local boxStroke = new("UIStroke", { Thickness = 1.5, LineJoinMode = Enum.LineJoinMode.Miter }, box)
+	local lines = {}
+	for i = 1, MAX_BONES do
+		lines[i] = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BorderSizePixel = 0,
+			Visible = false,
+		}, folder)
+	end
+
+	obj = { folder = folder, box = box, boxStroke = boxStroke, lines = lines, highlight = nil, shown = false }
+	espObjects[plr] = obj
+	return obj
+end
+
+local function hideESP(plr: Player)
+	local obj = espObjects[plr]
+	if obj and obj.shown then
+		obj.shown = false
+		obj.box.Visible = false
+		for _, line in ipairs(obj.lines) do
+			line.Visible = false
+		end
+		if obj.highlight then
+			obj.highlight:Destroy()
+			obj.highlight = nil
+		end
+	end
+end
+
+local function removeESP(plr: Player)
+	local obj = espObjects[plr]
+	if obj then
+		if obj.highlight then
+			obj.highlight:Destroy()
+		end
+		obj.folder:Destroy()
+		espObjects[plr] = nil
+	end
+end
+
+Players.PlayerRemoving:Connect(removeESP)
+
+local function getESPColor(plr: Player): Color3
+	if S.ESPTeamColors and plr.Team ~= nil then
+		return plr.Team.TeamColor.Color
+	end
+	return Color3.fromHSV(S.ESPHue, S.ESPSat, S.ESPVal)
+end
+
+-- list of {pointA, pointB} world-space bones for a character (R6 or R15)
+local function getBones(char: Model): { { Vector3 } }
+	local bones = {}
+	local function add(a: Vector3?, b: Vector3?)
+		if a and b then
+			table.insert(bones, { a, b })
+		end
+	end
+
+	if char:FindFirstChild("Torso") then -- R6
+		local function point(partName: string, y: number): Vector3?
+			local part = char:FindFirstChild(partName)
+			if part and part:IsA("BasePart") then
+				return (part.CFrame * CFrame.new(0, y, 0)).Position
+			end
+			return nil
+		end
+
+		local head = point("Head", 0)
+		local neck = point("Torso", 1)
+		local pelvis = point("Torso", -1)
+		add(head, neck)
+		add(neck, pelvis)
+		for _, limb in ipairs({ "Left Arm", "Right Arm" }) do
+			local shoulder, hand = point(limb, 1), point(limb, -1)
+			add(neck, shoulder)
+			add(shoulder, hand)
+		end
+		for _, limb in ipairs({ "Left Leg", "Right Leg" }) do
+			local hip, foot = point(limb, 1), point(limb, -1)
+			add(pelvis, hip)
+			add(hip, foot)
+		end
+	else -- R15
+		for _, pair in ipairs(R15_BONES) do
+			local a, b = char:FindFirstChild(pair[1]), char:FindFirstChild(pair[2])
+			if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+				add(a.Position, b.Position)
+			end
+		end
+	end
+
+	return bones
+end
+
+-- draws a 2D line between two screen points using a rotated frame
+local function setLine(line: Frame, a: Vector2, b: Vector2, color: Color3, thickness: number)
+	local delta = b - a
+	line.Size = UDim2.fromOffset(delta.Magnitude, thickness)
+	line.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+	line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+	line.BackgroundColor3 = color
+	line.Visible = true
+end
+
+local function updateESP()
+	local camPos = camera.CFrame.Position
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr == player then
+			continue
+		end
+
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local isTeammate = plr.Team ~= nil and plr.Team == player.Team
+
+		local show = S.ESP
+			and char ~= nil
+			and hum ~= nil
+			and hum.Health > 0
+			and root ~= nil
+			and (S.ESPShowTeammates or not isTeammate)
+			and ((root :: BasePart).Position - camPos).Magnitude <= S.ESPMaxDistance
+
+		if not show then
+			hideESP(plr)
+			continue
+		end
+
+		local obj = getObjects(plr)
+		obj.shown = true
+		local color = getESPColor(plr)
+		local thickness = S.ESPThickness
+
+		-- highlight (glow through walls)
+		if S.ESPHighlight then
+			local h = obj.highlight
+			if not h or h.Parent ~= char then
+				if h then
+					h:Destroy()
+				end
+				h = Instance.new("Highlight")
+				h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				h.Parent = char
+				obj.highlight = h
+			end
+			h.FillColor = color
+			h.OutlineColor = color
+			h.FillTransparency = S.ESPFill and 0.65 or 1
+			h.OutlineTransparency = 0
+		elseif obj.highlight then
+			obj.highlight:Destroy()
+			obj.highlight = nil
+		end
+
+		-- 2D box (size is estimated from the root part, so it stays steady while animating)
+		local rootPos = (root :: BasePart).Position
+		local top = camera:WorldToViewportPoint(rootPos + Vector3.new(0, 2.7, 0))
+		local bottom = camera:WorldToViewportPoint(rootPos - Vector3.new(0, 3.1, 0))
+		if S.ESPBox and top.Z > 0 and bottom.Z > 0 then
+			local height = bottom.Y - top.Y
+			local width = height * 0.6
+			obj.box.Position = UDim2.fromOffset(top.X - width / 2, top.Y)
+			obj.box.Size = UDim2.fromOffset(width, height)
+			obj.boxStroke.Color = color
+			obj.boxStroke.Thickness = thickness
+			obj.box.Visible = true
+		else
+			obj.box.Visible = false
+		end
+
+		-- skeleton
+		local used = 0
+		if S.ESPSkeleton then
+			for _, bone in ipairs(getBones(char :: Model)) do
+				local a = camera:WorldToViewportPoint(bone[1])
+				local b = camera:WorldToViewportPoint(bone[2])
+				if a.Z > 0 and b.Z > 0 and used < MAX_BONES then
+					used += 1
+					setLine(obj.lines[used], Vector2.new(a.X, a.Y), Vector2.new(b.X, b.Y), color, thickness)
+				end
+			end
+		end
+		for i = used + 1, MAX_BONES do
+			obj.lines[i].Visible = false
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- AIM LOOP
+----------------------------------------------------------------------
+local holding = false
+
+RunService:BindToRenderStep("AimAssist", Enum.RenderPriority.Camera.Value + 1, function(dt)
+	camera = Workspace.CurrentCamera
+	updateHud()
+	updateESP()
+
+	if not S.Enabled then
+		return
+	end
+	if S.RequireHold and not holding then
+		return
+	end
+
+	local target = getTarget(S.Fov)
+	if target then
+		local goal = CFrame.lookAt(camera.CFrame.Position, target.Position)
+		local alpha = 1 - math.exp(-S.Speed * dt) -- framerate-independent smoothing
+		camera.CFrame = camera.CFrame:Lerp(goal, alpha)
+	end
+end)
+
+----------------------------------------------------------------------
+-- INPUT
+----------------------------------------------------------------------
+-- FOV keys: normal press = FovStep, holding Left Shift = FovFineStep
+local function nudgeFov(direction: number)
+	local fine = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+	S.Fov = clampFov(S.Fov + direction * (fine and S.FovFineStep or S.FovStep))
+	refreshAll()
+end
+
+local function matches(input: InputObject, bind: EnumItem): boolean
+	if bind.EnumType == Enum.KeyCode then
+		return input.KeyCode == bind
+	end
+	return input.UserInputType == bind
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	-- rebinding: the next key (or right/middle mouse button) becomes the new bind
+	if listening then
+		if input.KeyCode == Enum.KeyCode.Escape then
+			listening = nil
+		elseif input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+			S.Keys[listening] = input.KeyCode
+			listening = nil
+		elseif
+			input.UserInputType == Enum.UserInputType.MouseButton2
+			or input.UserInputType == Enum.UserInputType.MouseButton3
+		then
+			S.Keys[listening] = input.UserInputType
+			listening = nil
+		else
+			return
+		end
+		refreshAll()
+		return
+	end
+
+	if processed then
+		return
+	end
+
+	if matches(input, S.Keys.AimHold) then
+		holding = true
+	end
+
+	if matches(input, S.Keys.ToggleAim) then
+		S.Enabled = not S.Enabled
+		refreshAll()
+	elseif matches(input, S.Keys.ToggleESP) then
+		S.ESP = not S.ESP
+		refreshAll()
+	elseif matches(input, S.Keys.FovUp) then
+		nudgeFov(1)
+	elseif matches(input, S.Keys.FovDown) then
+		nudgeFov(-1)
+	elseif matches(input, S.Keys.Menu) then
+		panel.Visible = not panel.Visible
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if matches(input, S.Keys.AimHold) then
+		holding = false
+	end
+end)
